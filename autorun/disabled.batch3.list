@@ -1,0 +1,19 @@
+# Batch 3: telemetry, ads, Find My, Apple Watch, Game Center. None of these has a use on this phone.
+# One launchd label a line; added to autorun's built-in list at every boot. If SpringBoard ever waits behind a black
+# screen, empty this file from TWRP (tools/drop.py with an empty list) and add jobs back a few at a time.
+com.apple.rtcreportingd
+com.apple.wifianalyticsd
+com.apple.osanalyticshelper
+com.apple.awdd
+com.apple.adprivacyd
+com.apple.promotedcontentd
+com.apple.parsecd
+com.apple.parsec-fbf
+com.apple.symptomsd
+com.apple.gamed
+com.apple.fmfd
+com.apple.fmflocatord
+com.apple.findmydeviced
+com.apple.searchpartyd
+com.apple.nanoregistryd
+com.apple.nanotimekitcompaniond

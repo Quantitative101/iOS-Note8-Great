@@ -1,0 +1,9 @@
+*.img
+*.bin
+*.adt
+*.dylib
+kernel.*
+logs/
+wifi-drop/
+loader/out/
+.DS_Store
