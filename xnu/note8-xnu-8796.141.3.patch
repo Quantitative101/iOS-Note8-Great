@@ -7543,10 +7543,10 @@ index 000000000..b5adfc764
 +#endif /* ARM64_BOARD_CONFIG_HEROLTE */
 diff --git a/bsd/dev/herolte_touch.c b/bsd/dev/herolte_touch.c
 new file mode 100644
-index 000000000..a8d84dab6
+index 000000000..00d5b019a
 --- /dev/null
 +++ b/bsd/dev/herolte_touch.c
-@@ -0,0 +1,2746 @@
+@@ -0,0 +1,3013 @@
 +/*
 + * HEROLTE (Galaxy S7 SM-G930F, Exynos 8890) touchscreen: Samsung sec_ts at
 + * 0x48 on HSI2C 0x14E10000 (pins GPF1-0/1, function 2), INT on GPA1-0
@@ -7640,6 +7640,7 @@ index 000000000..a8d84dab6
 +static bool gt_bitbang;
 +static bool gt_i2c_message(bool receive, uint8_t *bytes, unsigned count);
 +static void gt_ac_redraw(void);
++static void gt_cpu_guard(unsigned seconds);
 +static void gt_tmu_poll(void);
 +static void gt_periodic(void);
 +
@@ -8615,6 +8616,8 @@ index 000000000..a8d84dab6
 +	if (!on) {
 +		return;
 +	}
++	extern void herolte_pcprof_tick(void);
++	herolte_pcprof_tick();
 +	unsigned ncpu = ml_get_cpu_count();
 +	for (unsigned c = 0; c < ncpu && c < 8; c++) {
 +		uint64_t tid = 0;
@@ -8668,6 +8671,8 @@ index 000000000..a8d84dab6
 +	printf("%s\n", line);
 +	extern void herolte_sysprof_dump(void);
 +	herolte_sysprof_dump();
++	extern void herolte_pcprof_dump(void);
++	herolte_pcprof_dump();
 +	for (unsigned i = 0; i < GT_PROF_NAMES; i++) {
 +		gt_prof_count[i] = 0;
 +		gt_prof_name[i][0] = 0;
@@ -8750,6 +8755,7 @@ index 000000000..a8d84dab6
 +			gt_ac_redraw();
 +			gt_tmu_poll();
 +			gt_periodic();
++			gt_cpu_guard(ticks / 100);
 +			gl_dbg_line(4, "TSPI", ht_rd(alive, GT_ALIVE_GPA1_DAT), ht_rd(alive, 0x48));
 +		}
 +		/* Poll when INT is low, and once every 200 ms regardless in case the pin is not usable. */
@@ -9106,6 +9112,191 @@ index 000000000..a8d84dab6
 +	}
 +}
 +
++/*
++ * Boot arg greatlte_acpm_plugin=1: what Android's acpm.c plugins_init() does. ACPM's plugin table (framework +0, 44-byte
++ * entries: id +0, SRAM base +4 (bit 0 = Thumb), size +0x20, is_attached +0x1c, stay_attached +0x24, fw name +0x28)
++ * holds the CPU DVFS plugin (exynos8895_acpm_dvfs.fw) unattached and another in its slot attached: detach that one, copy
++ * the DVFS plugin there, attach it, both with a DP command on the framework channel (device tree acpm: 4). The plugin
++ * is Samsung's (Android kernel builtin firmware), read from the drop zone, never part of this source.
++ */
++#define AC_FW_CH        4
++#define AC_PLUGIN_PATH  "/private/var/herolte/acpm/dvfs.fw"
++extern uint32_t herolte_read_file(const char *path, void *buf, uint32_t max);
++
++static int
++gt_acpm_dp(vm_offset_t sram, vm_offset_t mbox, uint32_t id, bool attach)
++{
++	uint32_t cmd[4] = { (1u << (attach ? 25 : 24)) | (id << 26), 0, 0, 0 };
++	int rc = gt_acpm_xfer(sram, mbox, AC_FW_CH, cmd);
++	printf("ACPM: plugin %u %s -> rc %d reply %08x %08x %08x %08x\n", id, attach ? "attach" : "detach", rc, cmd[0], cmd[1],
++	    cmd[2], cmd[3]);
++	return rc;
++}
++
++static void
++gt_acpm_plugins(vm_offset_t sram, vm_offset_t mbox)
++{
++	int on = 0;
++	if ((!PE_parse_boot_argn("greatlte_acpm_plugin", &on, sizeof(on)) || !on) && !PE_parse_boot_argn("greatlte_cpu", &on, sizeof(on))) {
++		return;
++	}
++	uint32_t pl = ht_rd(sram, AC_INITDATA), npl = ht_rd(sram, AC_INITDATA + 4);
++	if (!ac_off_ok(pl, 44 * npl) || npl > 16) {
++		return;
++	}
++	int det = -1, att = -1;
++	for (uint32_t i = 0; i < npl; i++) {
++		uint32_t e = pl + 44 * i;
++		bool is = (ht_rd(sram, e + 0x1c) & 0xff) != 0, stay = (ht_rd(sram, e + 0x24) & 0xff) != 0;
++		if (is && !stay) {
++			det = (int)i;
++		} else if (!is && stay) {
++			att = (int)i;
++		}
++	}
++	if (att < 0) {
++		printf("ACPM: no plugin waits to be attached\n");
++		return;
++	}
++	uint32_t ea = pl + 44 * (uint32_t)att, base = ht_rd(sram, ea + 4) & ~1u, size = ht_rd(sram, ea + 0x20);
++	uint32_t id = ht_rd(sram, ea), name = ht_rd(sram, ea + 0x28);
++	printf("ACPM: plugin %u (name at %#x) wants attaching at %#x, %#x bytes; detach first: %d\n", id, name, base, size, det);
++	if (!ac_off_ok(base, size) || size > 0x8000) {
++		return;
++	}
++	static uint8_t blob[0x8000] __attribute__((aligned(4)));
++	uint32_t got = herolte_read_file(AC_PLUGIN_PATH, blob, sizeof(blob));
++	if (got != size) {
++		printf("ACPM: %s is %u bytes, the table says %u: not loading\n", AC_PLUGIN_PATH, got, size);
++		return;
++	}
++	ht_checkpoint();
++	if (det >= 0 && gt_acpm_dp(sram, mbox, ht_rd(sram, pl + 44 * (uint32_t)det), false) != 0) {
++		printf("ACPM: detach failed, not loading\n");
++		return;
++	}
++	for (uint32_t o = 0; o < size; o += 4) {
++		ht_wr(sram, base + o, *(uint32_t *)(blob + o));
++	}
++	__asm__ volatile ("dsb sy" ::: "memory");
++	uint32_t bad = 0;
++	for (uint32_t o = 0; o < size; o += 4) {
++		bad += ht_rd(sram, base + o) != *(uint32_t *)(blob + o);
++	}
++	printf("ACPM: plugin copied, %u words differ\n", bad);
++	ht_checkpoint();
++	gt_acpm_dp(sram, mbox, id, true);
++	gt_acpm_logdump(sram, "plugin");
++	ht_checkpoint();
++}
++
++/*
++ * Boot arg greatlte_cpu=MONGOOSE_MHZ[,A53_MHZ is greatlte_cpu_a53]: the everyday clock setting. Loads and attaches the
++ * DVFS plugin (gt_acpm_plugins), then asks ACPM's DVFS manager (channel 1, domain 2 = Mongoose cpus 4-7, 3 = A53 cpus
++ * 0-3, rates in kHz from the ECT's levels); the firmware picks the voltage. Tested 2026-11-05: 1703 MHz at 794 mV, and
++ * 2314 / 1690 MHz (hot without any throttling).
++ */
++static void gt_acpm_plugins(vm_offset_t sram, vm_offset_t mbox);
++
++static int gt_boost_mhz, gt_boost_a53;     /* what greatlte_cpu asked for; 0 = no boost, no guard */
++static vm_offset_t gt_guard_tmu;
++static int gt_guard_level;                  /* 0 boosted, 1 Mongoose eased, 2 both at the bootloader's rates */
++
++static int
++gt_cpu_set(uint32_t domain, int mhz)
++{
++	uint32_t cmd[4] = { domain, (uint32_t)mhz * 1000u, 0, 0 };
++	return gt_acpm_xfer(gt_ac_sram, gt_ac_mbox, 1, cmd);
++}
++
++/*
++ * Hottest TMU sensor in degrees C, or -1. TMU 0x10080000: per-sensor trim words at 0x00-0x14 (code at 25 C in bits 8:0,
++ * at 85 C in bits 17:9), current codes packed 9 bits each from 0x40 (0x40: sensors 0-1, 0x44: 2-4, 0x48: 5); a two-point
++ * line through the trims (about one code a degree: 282 and 342 here).
++ */
++static int
++gt_cpu_temp(void)
++{
++	if (!gt_guard_tmu) {
++		gt_guard_tmu = ml_io_map(0x10080000, 0x1000);
++		if (!gt_guard_tmu) {
++			return -1;
++		}
++	}
++	uint32_t w40 = ht_rd(gt_guard_tmu, 0x40), w44 = ht_rd(gt_guard_tmu, 0x44), w48 = ht_rd(gt_guard_tmu, 0x48);
++	uint32_t code[6] = { w40 & 0x1ff, (w40 >> 9) & 0x1ff, w44 & 0x1ff, (w44 >> 9) & 0x1ff, (w44 >> 18) & 0x1ff, w48 & 0x1ff };
++	int hottest = -1;
++	for (unsigned s = 0; s < 6; s++) {
++		uint32_t trim = ht_rd(gt_guard_tmu, 4 * s), t25 = trim & 0x1ff, t85 = (trim >> 9) & 0x1ff;
++		if (code[s] == 0 || t25 == 0 || t85 <= t25) {
++			continue;
++		}
++		int t = 25 + ((int)code[s] - (int)t25) * 60 / (int)(t85 - t25);
++		if (t > hottest && t < 150) {
++			hottest = t;
++		}
++	}
++	return hottest;
++}
++
++/* From the touch loop once a second: ease the clocks at 75 C and above, the bootloader's rates at 85, back below 65. */
++static void
++gt_cpu_guard(unsigned seconds)
++{
++	if (gt_boost_mhz == 0 || !gt_ac_sram) {
++		return;
++	}
++	int t = gt_cpu_temp();
++	if (t < 0) {
++		return;
++	}
++	int want = t >= 85 ? 2 : t >= 75 ? (gt_guard_level > 1 ? 2 : 1) : (t < 65 ? 0 : gt_guard_level);
++	if (want != gt_guard_level) {
++		int m = want == 0 ? gt_boost_mhz : want == 1 ? (gt_boost_mhz < 1469 ? gt_boost_mhz : 1469) : 1066;
++		int a = want == 2 ? 1053 : gt_boost_a53;
++		int r1 = gt_cpu_set(2, m), r2 = a ? gt_cpu_set(3, a) : 0;
++		printf("HEROLTE CPU: %d C, level %d -> %d: Mongoose %d MHz, A53 %d MHz (rc %d %d)\n", t, gt_guard_level, want, m,
++		    a, r1, r2);
++		gt_guard_level = want;
++	}
++	if (seconds % 30 == 0) {
++		printf("HEROLTE CPU: %d C, level %d\n", t, gt_guard_level);
++	}
++}
++
++static void
++gt_cpu_boost(void)
++{
++	int mhz = 0, a53 = 0;
++	if (!PE_parse_boot_argn("greatlte_cpu", &mhz, sizeof(mhz)) || mhz <= 0) {
++		return;
++	}
++	PE_parse_boot_argn("greatlte_cpu_a53", &a53, sizeof(a53));
++	vm_offset_t mbox = ml_io_map(AC_MBOX_PA, 0x1000), sram = ml_io_map(AC_SRAM_PA, AC_SRAM_SIZE);
++	if (!mbox || !sram) {
++		return;
++	}
++	gt_ac_sram = sram;
++	gt_ac_mbox = mbox;
++	gt_acpm_plugins(sram, mbox);
++	static const struct { uint32_t id; int *mhz; uint32_t lo, hi; } dom[] = {
++		{ 2, NULL, 741, 2314 }, { 3, NULL, 455, 1690 },
++	};
++	int *want[2] = { &mhz, &a53 };
++	for (unsigned i = 0; i < 2; i++) {
++		int m = *want[i];
++		if (m < (int)dom[i].lo || m > (int)dom[i].hi) {
++			continue;
++		}
++		uint32_t cmd[4] = { dom[i].id, (uint32_t)m * 1000u, 0, 0 };
++		int rc = gt_acpm_xfer(sram, mbox, 1, cmd);
++		printf("HEROLTE CPU: domain %u to %d MHz -> rc %d reply %08x %08x\n", dom[i].id, m, rc, cmd[0], cmd[1]);
++	}
++	gt_boost_mhz = mhz >= 741 && mhz <= 2314 ? mhz : 0;
++	gt_boost_a53 = a53 >= 455 && a53 <= 1690 ? a53 : 0;
++	printf("HEROLTE CPU: %d C at boost\n", gt_cpu_temp());
++}
++
 +static void
 +gt_acpm_run(int stage)
 +{
@@ -9127,6 +9318,35 @@ index 000000000..a8d84dab6
 +	if (fw >= AC_SRAM_SIZE || nch <= AC_DVFS_CH || fw + 72 * (AC_DVFS_CH + 1) > AC_SRAM_SIZE) {
 +		return;
 +	}
++	/* The plugin table (Samsung's plugins_init loads and attaches the ones with stay_attached and not is_attached; the
++	 * DVFS plugin's firmware is in Android's kernel): raw words, and any SRAM string a word points at. */
++	{
++		uint32_t pl = ht_rd(sram, AC_INITDATA), npl = ht_rd(sram, AC_INITDATA + 4);
++		printf("ACPM: plugins at %#x, %u of them\n", pl, npl);
++		for (uint32_t i = 0; pl && pl < AC_SRAM_SIZE && i < 0x180 && pl + i + 16 <= AC_SRAM_SIZE; i += 16) {
++			printf("ACPM: plg +%03x: %08x %08x %08x %08x\n", i, ht_rd(sram, pl + i), ht_rd(sram, pl + i + 4),
++			    ht_rd(sram, pl + i + 8), ht_rd(sram, pl + i + 12));
++		}
++		for (uint32_t i = 0; pl && i < 0x180 && pl + i + 4 <= AC_SRAM_SIZE; i += 4) {
++			uint32_t p = ht_rd(sram, pl + i);
++			if (p > 0x100 && p + 32 < AC_SRAM_SIZE && (p & 0xff000000) == 0) {
++				char s[33];
++				unsigned n = 0;
++				for (; n < 32; n++) {
++					char ch = (char)(ht_rd(sram, (p + n) & ~3u) >> (((p + n) & 3) * 8));
++					if (ch < 32 || ch > 126) {
++						break;
++					}
++					s[n] = ch;
++				}
++				s[n] = 0;
++				if (n >= 4) {
++					printf("ACPM: plg word +%03x -> %#x '%s'\n", i, p, s);
++				}
++			}
++		}
++	}
++	gt_acpm_plugins(sram, mbox);
 +	uint32_t c = fw + 72 * AC_DVFS_CH;
 +	printf("ACPM: framework read ok, next: DVFS commands\n");
 +	gt_acpm_logdump(sram, "before");
@@ -10119,6 +10339,51 @@ index 000000000..a8d84dab6
 +	}
 +}
 +
++/*
++ * Boot arg greatlte_cpuprobe=1: read-only dump of the CPU cluster clock controllers (CMU_CPUCL0 0x16800000 = Mongoose,
++ * CMU_CPUCL1 0x16900000 = A53; the ECT's DVFS SFR is PLL_CON0 at +0x120) and the S2MPS17 rails (0x1c vdd_cpucl0,
++ * 0x1e vdd_cpucl1: 300 mV + 6.25 mV a step), for the direct clock change.
++ */
++static void
++gt_cpu_probe(void)
++{
++	int on = 0;
++	if (!PE_parse_boot_argn("greatlte_cpuprobe", &on, sizeof(on)) || !on) {
++		return;
++	}
++	printf("CPUPROBE: begin, PMIC first\n");
++	ht_checkpoint();
++	vm_offset_t sp = ml_io_map(GT_SPEEDY_PA, 0x1000);
++	uint32_t v0 = 0xee, v1 = 0xee;
++	if (sp) {
++		gt_speedy(sp, false, 1, 0x1c, &v0);
++		gt_speedy(sp, false, 1, 0x1e, &v1);
++	}
++	printf("CPUPROBE: vdd_cpucl0 %#x (%u uV) vdd_cpucl1 %#x (%u uV)\n", v0, 300000 + v0 * 6250, v1, 300000 + v1 * 6250);
++	ht_checkpoint();
++	/* greatlte_cpuprobe=N: the first N ranges (v125 with all six hung the phone before the log was saved). */
++	static const uint32_t cmu[2] = { 0x16800000u, 0x16900000u };
++	static const uint32_t ranges[][2] = { { 0x100, 0x140 }, { 0x0, 0x40 }, { 0x1000, 0x1080 }, { 0x1800, 0x1880 },
++		{ 0x2000, 0x2040 }, { 0x3000, 0x3040 } };
++	unsigned nr = (unsigned)on < sizeof(ranges) / sizeof(ranges[0]) ? (unsigned)on : sizeof(ranges) / sizeof(ranges[0]);
++	for (unsigned k = 0; k < 2; k++) {
++		vm_offset_t b = ml_io_map(cmu[k], 0x4000);
++		if (!b) {
++			continue;
++		}
++		for (unsigned r = 0; r < nr; r++) {
++			printf("CPUPROBE: next cmu%u +%04x\n", k, ranges[r][0]);
++			ht_checkpoint();
++			for (uint32_t off = ranges[r][0]; off < ranges[r][1]; off += 16) {
++				printf("CPUPROBE: cmu%u +%04x: %08x %08x %08x %08x\n", k, off, ht_rd(b, off), ht_rd(b, off + 4),
++				    ht_rd(b, off + 8), ht_rd(b, off + 12));
++			}
++		}
++	}
++	printf("CPUPROBE: done\n");
++	ht_checkpoint();
++}
++
 +static void
 +gt_thread(void *arg, __unused wait_result_t wr)
 +{
@@ -10130,6 +10395,8 @@ index 000000000..a8d84dab6
 +	 * N cycles; the 26 MHz generic timer gives the elapsed time. CPU line: MHz (decimal digits as hex), CPU number,
 +	 * three samples (a busy system or preemption only makes a sample read low).
 +	 */
++	gt_cpu_probe();
++	gt_cpu_boost();
 +	int acpm = 0;
 +	PE_parse_boot_argn("greatlte_acpm", &acpm, sizeof(acpm));
 +	for (int pass = 0; pass < 4; pass++) {
@@ -11230,10 +11497,10 @@ index 000000000..9b4d7f329
 +#endif /* ARM64_BOARD_CONFIG_HEROLTE */
 diff --git a/bsd/dev/herolte_wifi.c b/bsd/dev/herolte_wifi.c
 new file mode 100644
-index 000000000..4ae57e7d6
+index 000000000..ea869e2e5
 --- /dev/null
 +++ b/bsd/dev/herolte_wifi.c
-@@ -0,0 +1,2286 @@
+@@ -0,0 +1,2294 @@
 +/*
 + * herowifi=1, second step: the BCM4359's firmware. The link is up (bsd/dev/herolte_gpu.c) and BAR0 and BAR2 are assigned.
 + * As Linux's brcmfmac (chip.c, pcie.c, ISC license): the backplane's cores from the enumeration ROM, the ARM and the radio
@@ -11435,6 +11702,14 @@ index 000000000..4ae57e7d6
 +		return 0;
 +	}
 +	return max - (uint32_t)resid;
++}
++
++/* For herolte_touch.c (the ACPM DVFS plugin from the drop zone). */
++uint32_t herolte_read_file(const char *path, void *buf, uint32_t max);
++uint32_t
++herolte_read_file(const char *path, void *buf, uint32_t max)
++{
++	return hw_read_file(path, buf, max);
 +}
 +
 +/*
@@ -117393,7 +117668,7 @@ index 000000000..618654192
 +#endif /* SWEET */
 diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
 new file mode 100644
-index 000000000..6a2567a01
+index 000000000..cc9b6f68b
 --- /dev/null
 +++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
 @@ -0,0 +1,1505 @@
@@ -118182,7 +118457,7 @@ index 000000000..6a2567a01
 +static void
 +sweet_fb_copy_init(void)
 +{
-+	uint32_t helpers = 3;
++	uint32_t helpers = 7;
 +	PE_parse_boot_argn("sweetfb_copythreads", &helpers, sizeof(helpers));
 +	if (helpers > SWEET_FB_COPY_MAX_HELPERS) {
 +		helpers = SWEET_FB_COPY_MAX_HELPERS;
@@ -164960,7 +165235,7 @@ index 0a00656a0..437adb105 100644
  	read_lbr();
  #endif
 diff --git a/osfmk/kern/exception.c b/osfmk/kern/exception.c
-index 809dafaaa..76d70b923 100644
+index 809dafaaa..d6106a4b6 100644
 --- a/osfmk/kern/exception.c
 +++ b/osfmk/kern/exception.c
 @@ -820,6 +820,237 @@ exception_triage(
@@ -165201,6 +165476,126 @@ index 809dafaaa..76d70b923 100644
  kern_return_t
  bsd_exception(
  	exception_type_t        exception,
+@@ -910,3 +1141,119 @@ sys_perf_notify(thread_t thread, int pid)
+ 
+ 	return ret;
+ }
++
++#if defined(ARM64_BOARD_CONFIG_HEROLTE)
++#include <vm/vm_shared_region.h>
++#include <arm/cpu_data_internal.h>
++#include <arm64/proc_reg.h>
++
++/*
++ * HEROLTE PC sampler (boot arg greatlte_pcprof=1): the touch thread's profiler sends every other CPU an xcall each
++ * tick; the handler, in that CPU's interrupt context, notes where the interrupted backboardd thread was in user space,
++ * unslid by the shared cache slide (shared cache pcs = pc - slide then match the IPSW's cache) or as an offset into the
++ * main binary (main binary pcs are tagged with bit 63). herolte_pcprof_dump() prints the busiest addresses.
++ */
++#define HPP_SLOTS 4096
++static uint64_t hpp_pc[HPP_SLOTS];
++static uint32_t hpp_count[HPP_SLOTS];
++static uint32_t hpp_user, hpp_kernel, hpp_other, hpp_lost;
++static char hpp_target[20] = "backboardd";
++
++
++extern void *get_bsdtask_info(task_t);
++
++static void
++hpp_record(uint64_t pc)
++{
++	uint32_t h = (uint32_t)((pc >> 2) * 2654435761u) % HPP_SLOTS;
++	for (uint32_t i = 0; i < 16; i++, h = (h + 1) % HPP_SLOTS) {
++		uint64_t cur = __atomic_load_n(&hpp_pc[h], __ATOMIC_RELAXED);
++		if (cur == pc || (cur == 0 && __atomic_compare_exchange_n(&hpp_pc[h], &cur, pc, false, __ATOMIC_RELAXED,
++		    __ATOMIC_RELAXED)) || cur == pc) {
++			__atomic_fetch_add(&hpp_count[h], 1, __ATOMIC_RELAXED);
++			return;
++		}
++	}
++	__atomic_fetch_add(&hpp_lost, 1, __ATOMIC_RELAXED);
++}
++
++static void
++hpp_xcall(void *arg __unused)
++{
++	task_t task = current_task();
++	void *p = get_bsdtask_info(task);
++	if (p == NULL || strcmp(proc_best_name((struct proc *)p), hpp_target) != 0) {
++		__atomic_fetch_add(&hpp_other, 1, __ATOMIC_RELAXED);
++		return;
++	}
++	arm_saved_state_t *ss = getCpuDatap()->cpu_int_state;
++	if (ss == NULL || !is_saved_state64(ss) || !PSR64_IS_USER(get_saved_state_cpsr(ss))) {
++		__atomic_fetch_add(&hpp_kernel, 1, __ATOMIC_RELAXED);
++		return;
++	}
++	uint64_t pc = get_saved_state_pc(ss), mh = task->mach_header_vm_address, slide = 0;
++	vm_shared_region_t sr = task->shared_region;
++	if (sr != NULL) {
++		slide = sr->sr_slide;
++	}
++	if (mh && pc >= mh && pc < mh + 0x10000000ull) {
++		pc = (1ull << 63) | (pc - mh);
++	} else {
++		pc -= slide;
++	}
++	__atomic_fetch_add(&hpp_user, 1, __ATOMIC_RELAXED);
++	hpp_record(pc);
++}
++
++static int hpp_on = -1;
++static uint32_t hpp_param = 1;
++
++void herolte_pcprof_tick(void);
++void
++herolte_pcprof_tick(void)
++{
++	if (hpp_on < 0) {
++		hpp_on = 0;
++		PE_parse_boot_argn("greatlte_pcprof", &hpp_on, sizeof(hpp_on));
++		PE_parse_boot_argn("greatlte_pcprof_proc", hpp_target, sizeof(hpp_target));
++	}
++	if (!hpp_on) {
++		return;
++	}
++	int self = cpu_number();
++	for (int c = 0; c <= ml_get_max_cpu_number() && c < 8; c++) {
++		if (c != self) {
++			(void)cpu_xcall(c, hpp_xcall, &hpp_param);
++		}
++	}
++}
++
++void herolte_pcprof_dump(void);
++void
++herolte_pcprof_dump(void)
++{
++	if (hpp_on <= 0) {
++		return;
++	}
++	printf("PCPROF: %s user %u kernel %u other %u lost %u\n", hpp_target, hpp_user, hpp_kernel, hpp_other, hpp_lost);
++	for (int k = 0; k < 40; k++) {
++		uint32_t best = 0, bi = 0;
++		for (uint32_t i = 0; i < HPP_SLOTS; i++) {
++			if (hpp_count[i] > best) {
++				best = hpp_count[i];
++				bi = i;
++			}
++		}
++		if (best == 0) {
++			break;
++		}
++		printf("PCPROF: %u %s0x%llx\n", best, (hpp_pc[bi] >> 63) ? "main+" : "", hpp_pc[bi] & ~(1ull << 63));
++		hpp_count[bi] = 0;
++	}
++	for (uint32_t i = 0; i < HPP_SLOTS; i++) {
++		hpp_count[i] = 0;
++		hpp_pc[i] = 0;
++	}
++	hpp_user = hpp_kernel = hpp_other = hpp_lost = 0;
++}
++#endif
 diff --git a/osfmk/kern/processor.c b/osfmk/kern/processor.c
 index aad9f3b7b..7dc9da639 100644
 --- a/osfmk/kern/processor.c

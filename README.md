@@ -17,8 +17,50 @@ no IPSW contents, device trees, boot images, kernels, firmware or bootloader pie
 - Wi-Fi (BCM4361 over PCIe): open and WPA2 networks; WPA3 is not supported by the firmware
 - Mali-G71 runs jobs; Mesa Panfrost draws through a small shim (slower than the CPU path for the UI for now)
 
-Not working: cellular, Bluetooth, audio, camera, sensors, USB device mode, CPU frequency scaling (ACPM accepts requests
-but the clocks stay at the bootloader's ~1.05 GHz).
+- CPU clocks above the bootloader's: Mongoose 1703 MHz and A53 1690 MHz through Samsung's ACPM firmware, with a thermal
+  guard that steps the clocks down when the SoC gets hot (see below)
+- Idle CPU use cut by stopping a HAL plug-in lookup loop in mediaserverd (`autorun/`)
+
+Not working: cellular, Bluetooth, audio, camera, sensors, USB device mode, joining networks from iOS Settings
+(the kernel joins the network given in a drop-zone file instead).
+
+## CPU clocks and thermal guard
+
+S-Boot leaves the Mongoose cores (cpus 4-7) at about 1065 MHz and the A53 cores (cpus 0-3) at 1053 MHz. On the
+Exynos 8895 the CPU PLLs and rails belong to the ACPM co-processor, and its stock firmware only answers clock requests
+once Android's DVFS plug-in is attached. With boot argument `greatlte_cpu=MHZ` (Mongoose) and optionally
+`greatlte_cpu_a53=MHZ` the kernel copies that plug-in into ACPM's SRAM, attaches it, and requests the rates (ACPM's
+DVFS manager, channel 1, domain 2 = Mongoose, 3 = A53; rates from the ECT tables). ACPM picks the voltage itself.
+
+The plug-in is Samsung firmware and is **not** in this repository: it is built into the TWRP/stock kernel for this phone
+as `exynos8895_acpm_dvfs.fw` (0x5c00 bytes). Extract it from your own kernel image and put it in the drop zone at
+`/private/var/herolte/acpm/dvfs.fw` (`tools/drop.py`). Without it the plug-in is not loaded and the requests change nothing.
+
+The thermal guard (`gt_cpu_guard`, runs from the touch loop once a second) reads the TMU at `0x10080000` (per-sensor
+trims at 0x00-0x14, 9-bit codes at 0x40-0x48) and takes the hottest sensor:
+
+| Hottest sensor | Clocks |
+|---|---|
+| >= 75 C | Mongoose eased to 1469 MHz |
+| >= 85 C | both clusters back to the bootloader's rates (1066 / 1053 MHz) |
+| < 65 C | back to the requested rates |
+
+2314 MHz on the Mongoose cluster works but reaches 86 C within seconds of boot and then keeps cycling, so the
+everyday setting is 1703 / 1690 MHz. The boot arguments used on the test phone (image v130):
+
+```
+debug=0xc serial=3 cpus=8 keepsyms=1 -enable_kprintf_spam -noprogress rd=ufsroot0 ufsroot=USERDATA ufsrw=1 rootrw=1
+cs_enforcement_disable=1 unentitled_ios_sim_launch=1 ignition_level=1 launchd_unsecure_cache=1 wdt=-1 -wdt_no_pmu
+wdt_test=no_user_checkin herotouch=0 herofg=0 greatlte_touch=3 a5fb_noconsole=1 sweetfb_scale=1 sweetfb_lw=750
+sweetfb_lh=1542 herosb=1 greatlte_fg=1 a5fb_nospan=1 greatlte_wifi=1 sweetfb_hz=30 greatlte_cpu=1703 greatlte_cpu_a53=1690
+```
+
+(one line; S-Boot cuts the payload command line at about 608 characters, extra arguments are silently lost).
+Running the CPUs faster makes the phone hotter; this is an experiment, use it at your own risk.
+
+Diagnostics: `greatlte_prof=1` (per-process CPU samples in the kernel log), `greatlte_pcprof=1` (user PC samples,
+symbolized with `tools/pcprof-sym.sh` against your own root's shared cache), `tools/twrp-rails.sh` (CPU/GPU rail
+voltages and PMIC registers from TWRP), `tools/acpm-run.sh` (timed ACPM experiments).
 
 ## Layout
 

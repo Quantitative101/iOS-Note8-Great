@@ -255,9 +255,42 @@ hide_bt_audio(void)
       fclose(note);
 }
 
+/*
+ * backboardd spent a third of its drawing in CoreAnimation's software 4x4 color matrix (greatlte_pcprof, 2026-11-05),
+ * with the phone in Dark Mode. DROP_DIR nodim: Dark Mode without the wallpaper dimming (SpringBoard's
+ * SBEnableWallpaperDimming). DROP_DIR light: Light Mode (UIKit's UserInterfaceStyleMode 1). Both take effect for
+ * SpringBoard's next start.
+ */
+static void
+set_appearance(void)
+{
+   CFStringRef user = CFSTR("mobile");
+   if (access(DROP_DIR "nodim", F_OK) == 0) {
+      CFPreferencesSetValue(CFSTR("SBEnableWallpaperDimming"), kCFBooleanFalse, CFSTR("com.apple.springboard"), user,
+          kCFPreferencesAnyHost);
+      CFPreferencesSynchronize(CFSTR("com.apple.springboard"), user, kCFPreferencesAnyHost);
+   }
+   /* DROP_DIR ax.reset: Reduce Transparency and Reduce Motion back off (ax.off alone only stops setting them). */
+   if (access(DROP_DIR "ax.reset", F_OK) == 0) {
+      CFStringRef ax = CFSTR("com.apple.Accessibility");
+      CFPreferencesSetValue(CFSTR("EnhancedBackgroundContrastEnabled"), kCFBooleanFalse, ax, user, kCFPreferencesAnyHost);
+      CFPreferencesSetValue(CFSTR("ReduceMotionEnabled"), kCFBooleanFalse, ax, user, kCFPreferencesAnyHost);
+      CFPreferencesSynchronize(ax, user, kCFPreferencesAnyHost);
+   }
+   if (access(DROP_DIR "light", F_OK) == 0 || access(DROP_DIR "dark", F_OK) == 0) {
+      int one = access(DROP_DIR "light", F_OK) == 0 ? 1 : 2;
+      CFNumberRef mode = CFNumberCreate(NULL, kCFNumberIntType, &one);
+      CFStringRef domain = CFSTR("com.apple.uikitservices.userInterfaceStyleMode");
+      CFPreferencesSetValue(CFSTR("UserInterfaceStyleMode"), mode, domain, user, kCFPreferencesAnyHost);
+      CFPreferencesSynchronize(domain, user, kCFPreferencesAnyHost);
+      CFRelease(mode);
+   }
+}
+
 int
 main(void)
 {
+   set_appearance();
    if (access(DROP_DIR "present.on", F_OK) == 0)
       run_present();
    hide_bt_audio();
