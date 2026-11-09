@@ -4244,10 +4244,10 @@ index 000000000..0719b0ba2
 +#endif /* ARM64_BOARD_CONFIG_HEROLTE */
 diff --git a/bsd/dev/herolte_gl.c b/bsd/dev/herolte_gl.c
 new file mode 100644
-index 000000000..4db8c8575
+index 000000000..848f01147
 --- /dev/null
 +++ b/bsd/dev/herolte_gl.c
-@@ -0,0 +1,213 @@
+@@ -0,0 +1,221 @@
 +/*
 + * HEROLTE GL: CoreAnimation's render server (backboardd) on the Mali.
 + *
@@ -4352,6 +4352,14 @@ index 000000000..4db8c8575
 +	base = base ? base + 1 : path;
 +	/* The watch face's poster aborts as it starts, and PosterBoard starts it again every few seconds. */
 +	if (strcmp(base, "AegirPoster") == 0) {
++		return true;
++	}
++	/*
++	 * The speech synthesizers' audio units abort as PlugInKit starts them (an Objective-C exception out of its
++	 * plug-in set-up) and are started again all session: 54 crashes in boot-0323, each a process launch.
++	 */
++	if (strcmp(base, "SiriTTSSynthesizerAU") == 0 || strcmp(base, "KonaSynthesizer") == 0 ||
++	    strcmp(base, "MacinTalkAUSP") == 0) {
 +		return true;
 +	}
 +	if (hgl_noexec[0] == '\0') {
@@ -7543,10 +7551,10 @@ index 000000000..b5adfc764
 +#endif /* ARM64_BOARD_CONFIG_HEROLTE */
 diff --git a/bsd/dev/herolte_touch.c b/bsd/dev/herolte_touch.c
 new file mode 100644
-index 000000000..00d5b019a
+index 000000000..12b6eee6e
 --- /dev/null
 +++ b/bsd/dev/herolte_touch.c
-@@ -0,0 +1,3013 @@
+@@ -0,0 +1,3094 @@
 +/*
 + * HEROLTE (Galaxy S7 SM-G930F, Exynos 8890) touchscreen: Samsung sec_ts at
 + * 0x48 on HSI2C 0x14E10000 (pins GPF1-0/1, function 2), INT on GPA1-0
@@ -10384,6 +10392,86 @@ index 000000000..00d5b019a
 +	ht_checkpoint();
 +}
 +
++/*
++ * Boot arg greatlte_dispprobe=N: read-only look at the display path, for tear-free flips. 1: DECON_F (0x12860000; the device
++ * tree has default window 5, IDMA 0, command mode with hardware TE), its line counter sampled, and any word holding the
++ * framebuffer's address 0xcc000000. 2: also the first DPP/IDMA block (0x128b1000) and common (0x128b0000). The log is saved
++ * before each block, since a gated block's registers hang the CPU.
++ */
++static void
++gt_disp_dump(const char *name, uint32_t pa, uint32_t size)
++{
++	printf("DISPPROBE: next %s %#x\n", name, pa);
++	ht_checkpoint();
++	vm_offset_t b = ml_io_map(pa, 0x1000);
++	if (!b) {
++		return;
++	}
++	for (uint32_t off = 0; off < size; off += 16) {
++		uint32_t w[4] = { ht_rd(b, off), ht_rd(b, off + 4), ht_rd(b, off + 8), ht_rd(b, off + 12) };
++		if (w[0] | w[1] | w[2] | w[3]) {
++			printf("DISPPROBE: %s +%03x: %08x %08x %08x %08x\n", name, off, w[0], w[1], w[2], w[3]);
++		}
++		for (unsigned i = 0; i < 4; i++) {
++			if (w[i] == 0xcc000000u) {
++				printf("DISPPROBE: %s +%03x holds the framebuffer address\n", name, off + 4 * i);
++			}
++		}
++	}
++	ht_checkpoint();
++}
++
++static void
++gt_disp_probe(void)
++{
++	int on = 0;
++	if (!PE_parse_boot_argn("greatlte_dispprobe", &on, sizeof(on)) || on <= 0) {
++		return;
++	}
++	gt_disp_dump("decon", 0x12860000u, 0x400);
++	vm_offset_t d = ml_io_map(0x12860000u, 0x1000);
++	if (d) {
++		for (unsigned i = 0; i < 16; i++) {
++			printf("DISPPROBE: line counter %u\n", ht_rd(d, 0x8c) & 0xffff);
++			delay(1700);
++		}
++		ht_checkpoint();
++	}
++	if (on == 3) {
++		/*
++		 * First write to the display path: IDMA0's base address (+0x40) to a second buffer, solid magenta, for 12 s and
++		 * back. 0xcd200000 is DRAM outside XNU (bank 2) and outside every reserved-memory node, past the panel buffer.
++		 */
++		vm_offset_t idma = ml_io_map(0x128b1000u, 0x1000), fb2 = ml_io_map(0xcd200000u, 0x1044000);
++		if (idma && fb2 && d && ht_rd(idma, 0x40) == 0xcc000000u) {
++			for (uint32_t o = 0; o < 0x1044000; o += 4) {
++				ht_wr(fb2, o, 0xffff00ffu);
++			}
++			__asm__ volatile ("dsb sy" ::: "memory");
++			printf("DISPFLIP: buffer filled, DECON +70 %08x; writing IDMA base\n", ht_rd(d, 0x70));
++			ht_wr(idma, 0x40, 0xcd200000u);
++			ht_wr(d, 0x60, ht_rd(d, 0x60) | 0x8000003fu);  /* decon_reg_all_win_shadow_update_req and _update_req_global */
++			for (unsigned i = 0; i < 12; i++) {
++				ht_msleep(1000);
++				printf("DISPFLIP: %us: base %08x DECON +60 %08x +70 %08x\n", i + 1, ht_rd(idma, 0x40), ht_rd(d, 0x60), ht_rd(d, 0x70));
++			}
++			ht_wr(idma, 0x40, 0xcc000000u);
++			ht_wr(d, 0x60, ht_rd(d, 0x60) | 0x8000003fu);
++			ht_msleep(100);
++			printf("DISPFLIP: restored, base %08x\n", ht_rd(idma, 0x40));
++		} else {
++			printf("DISPFLIP: not as expected, nothing written\n");
++		}
++		return;
++	}
++	if (on >= 2) {
++		gt_disp_dump("idma0", 0x128b1000u, 0x400);
++		gt_disp_dump("dppcommon", 0x128b0000u, 0x100);
++	}
++	printf("DISPPROBE: done\n");
++	ht_checkpoint();
++}
++
 +static void
 +gt_thread(void *arg, __unused wait_result_t wr)
 +{
@@ -10395,6 +10483,7 @@ index 000000000..00d5b019a
 +	 * N cycles; the 26 MHz generic timer gives the elapsed time. CPU line: MHz (decimal digits as hex), CPU number,
 +	 * three samples (a busy system or preemption only makes a sample read low).
 +	 */
++	gt_disp_probe();
 +	gt_cpu_probe();
 +	gt_cpu_boost();
 +	int acpm = 0;
@@ -15714,10 +15803,10 @@ index 000000000..4da50d882
 +#endif /* ARM64_BOARD_CONFIG_SWEET */
 diff --git a/bsd/dev/sweet_sample.c b/bsd/dev/sweet_sample.c
 new file mode 100644
-index 000000000..9778ac07b
+index 000000000..7620c41c1
 --- /dev/null
 +++ b/bsd/dev/sweet_sample.c
-@@ -0,0 +1,189 @@
+@@ -0,0 +1,228 @@
 +#if defined(ARM64_BOARD_CONFIG_SWEET) || defined(ARM64_BOARD_CONFIG_HEROLTE)
 +/*
 + * SWEET process sampler: where is a daemon stuck?
@@ -15820,6 +15909,42 @@ index 000000000..9778ac07b
 +static unsigned sweet_top_n;
 +static uint64_t sweet_top_gen;
 +
++#if defined(ARM64_BOARD_CONFIG_HEROLTE)
++/*
++ * WidgetKit extensions with a CPU limit of their own (boot-arg herowidgetcap=N percent of one core, default 30, 0 off).
++ * CalendarWidgetExtension re-evaluated its SwiftUI graph without end (AttributeGraph AGGraphGetValue in every sample,
++ * boot-cal): two cores at 100% for the whole session, the phone's heat, and the cores the window server needed.
++ * Refusing it was worse (0315: SpringBoard kept asking for it) and PRIO_DARWIN_BG did nothing while cores were idle
++ * (hero-run, boot-0323t: still 199%). XNU's own task-wide CPU limit (proc_set_task_ruse_cpu, THROTTLE: the task's
++ * threads block once the share of each second is spent) lets it run and draw, at a fixed cost.
++ */
++#define HERO_RUSE_THROTTLE 0x01         /* TASK_POLICY_RESOURCE_ATTRIBUTE_THROTTLE, osfmk/kern/policy_internal.h */
++extern int proc_set_task_ruse_cpu(task_t task, uint16_t policy, uint8_t percentage, uint64_t interval, uint64_t deadline,
++    int cpumon_entitled);
++
++static void
++sweet_top_cap(task_t task, const char *name)
++{
++	static int percent = -1;
++	static unsigned told;
++	if (percent < 0) {
++		percent = 30;
++		PE_parse_boot_argn("herowidgetcap", &percent, sizeof(percent));
++	}
++	bool widget = false;
++	for (const char *c = name; *c != '\0' && !widget; c++) {
++		widget = strncmp(c, "Widge", 5) == 0;
++	}
++	if (percent <= 0 || percent > 100 || !widget) {
++		return;
++	}
++	int err = proc_set_task_ruse_cpu(task, HERO_RUSE_THROTTLE, (uint8_t)percent, 0, 0, 1);
++	if (told++ < 24) {
++		printf("HEROLTE CAP: %s limited to %d%% of a core: %d\n", name, percent, err);
++	}
++}
++#endif
++
 +static int
 +sweet_top_proc(proc_t p, __unused void *arg)
 +{
@@ -15846,6 +15971,9 @@ index 000000000..9778ac07b
 +		sweet_top[i].pid = pid;
 +		sweet_top[i].abs = abs;         /* first sight: no delta yet */
 +		proc_name(pid, sweet_top[i].name, sizeof(sweet_top[i].name));
++#if defined(ARM64_BOARD_CONFIG_HEROLTE)
++		sweet_top_cap(task, sweet_top[i].name);
++#endif
 +	}
 +	sweet_top[i].delta = abs > sweet_top[i].abs ? abs - sweet_top[i].abs : 0;
 +	sweet_top[i].abs = abs;
@@ -117668,10 +117796,10 @@ index 000000000..618654192
 +#endif /* SWEET */
 diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
 new file mode 100644
-index 000000000..cc9b6f68b
+index 000000000..76fa2f2d6
 --- /dev/null
 +++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
-@@ -0,0 +1,1505 @@
+@@ -0,0 +1,1652 @@
 +/*
 + * Built-in IOMobileFramebuffer for SWEET: the ABL's continuous-splash
 + * framebuffer (1080x2400 a8r8g8b8 in RAM, the panel scans it out by
@@ -117736,10 +117864,12 @@ index 000000000..cc9b6f68b
 +static uint32_t sweet_fb_panel[4];
 +static uint32_t sweet_fb_helper_stats[3];
 +static bool     sweet_fb_shadow_stale;
++static void     sfb_primary(void);
 +static bool sweet_fb_helper_present(uint32_t id, int32_t sx, int32_t sy, int32_t w, int32_t h);
 +/* No CPU copies to the panel before this mach time (herolte_gpu.c). */
 +extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
 +extern "C" uint64_t sweet_fb_hold_until;
++extern "C" boolean_t mach_timer_coalescing_enabled;    /* osfmk/kern/timer_call.c, sysctl kern.timer_coalescing_enabled */
 +uint64_t sweet_fb_hold_until;
 +/* Last surface copied full-screen to the panel (GPU copy test). */
 +static uint32_t sweet_fb_last_surface_id;
@@ -117805,6 +117935,7 @@ index 000000000..cc9b6f68b
 +	AppleCLCD       *self;
 +	uintptr_t       src;
 +	uint32_t        srcRowBytes;
++	uintptr_t       pixels;         /* the panel buffer drawn into */
 +	int32_t         dx, dy, w, h, px0, pw, py0, py1;
 +	const uint16_t  *column;
 +	uint32_t        *shadow;
@@ -118022,6 +118153,48 @@ index 000000000..cc9b6f68b
 +		fDecon = no_sync ? 0 : ml_io_map(0x12860000u, 0x1000);
 +#endif
 +	}
++#if defined(ARM64_BOARD_CONFIG_HEROLTE)
++	{
++		/*
++		 * From Scion's MiniIOMobileFramebuffer (Galaxy S9). CoreAnimation draws when a timer of its own fires
++		 * (CA_FORCE_TIMER=1 here), and with the kernel's timer coalescing on such a timer may fire up to 100 ms late
++		 * for a thread that is not real-time: on the S9 the frames came exactly 100 ms apart. Off (sweetfb_tcoal=1
++		 * leaves it on). And IOMFBDisplayRefresh, which this driver never published: told 120 Hz (sweetfb_cahz=N, 0
++		 * leaves it out) CoreAnimation starts each frame on an 8.3 ms tick and has more of the 16.7 ms of a refresh
++		 * for its render thread and the GPU; on the S9 it cut the refreshes missed while a finger moved from 16-25 to
++		 * 3-9 in some 100 frames. Intervals in 2^-32 s, MachTime in ticks.
++		 */
++		int keep = 0;
++		PE_parse_boot_argn("sweetfb_tcoal", &keep, sizeof(keep));
++		if (!keep && mach_timer_coalescing_enabled) {
++			mach_timer_coalescing_enabled = FALSE;
++		}
++		uint32_t told = 120;
++		PE_parse_boot_argn("sweetfb_cahz", &told, sizeof(told));
++		OSDictionary *refresh = (told >= 30 && told <= 240) ? OSDictionary::withCapacity(4) : NULL;
++		if (refresh != NULL) {
++			uint64_t interval = (1ULL << 32) / told, ticks = 0;
++			nanoseconds_to_absolutetime(NSEC_PER_SEC / told, &ticks);
++			static const char *const keys[] = { "displayMinRefreshInterval", "displayMaxRefreshInterval", "displayRefreshStep" };
++			for (unsigned k = 0; k < 3; k++) {
++				OSNumber *n = OSNumber::withNumber(interval, 64);
++				if (n != NULL) {
++					refresh->setObject(keys[k], n);
++					n->release();
++				}
++			}
++			OSNumber *t = OSNumber::withNumber(ticks, 64);
++			if (t != NULL) {
++				refresh->setObject("displayRefreshStepMachTime", t);
++				t->release();
++			}
++			setProperty("IOMFBDisplayRefresh", refresh);
++			refresh->release();
++		}
++		IOLog("HEROLTE FB: timer coalescing %s; CoreAnimation told %u Hz\n", mach_timer_coalescing_enabled ? "on" : "off",
++		    refresh != NULL ? told : 0);
++	}
++#endif
 +	uint32_t hz = 10;
 +#if defined(ARM64_BOARD_CONFIG_A5XELTE)
 +	/* A5's 1080x1920 panel copies 8.29 MB per full frame. Keep the
@@ -118178,6 +118351,10 @@ index 000000000..cc9b6f68b
 +			fb->fFadeStep = step + 1;
 +		}
 +		IOLockUnlock(fb->fLock);
++		if (step == 0) {
++			sfb_primary();          /* the fade writes the first buffer: shown first */
++			__atomic_store_n(&sweet_fb_shadow_stale, true, __ATOMIC_RELEASE);
++		}
 +		if (step <= 6) {
 +			for (uint32_t y = 0; y < fb->fHeight; y++) {
 +				volatile uint32_t *row = (volatile uint32_t *)(fb->fPixels + (uint64_t)y * fb->fRowBytes);
@@ -118534,6 +118711,80 @@ index 000000000..cc9b6f68b
 +}
 +#endif
 +
++#if defined(ARM64_BOARD_CONFIG_HEROLTE)
++/*
++ * Note 8, boot-arg sweetfb_flip=1: two panel buffers, so the panel only ever gets whole frames. A frame is drawn into the
++ * one not shown (0xcc000000 is S-Boot's; 0xcd200000 is DRAM outside XNU and every reserved-memory node), then IDMA0's base
++ * address (0x128b1000 +0x40) changes and DECON_F +0x60 asks for the update (Samsung's dma_reg_set_in_base_addr and
++ * decon_reg_all_win_shadow_update_req / _update_req_global). The register clears when the hardware has taken it; until
++ * then the other buffer may still be read. An update never taken: back to one buffer for good.
++ */
++#define SFB_PA0         0xcc000000u
++#define SFB_PA1         0xcd200000u
++#define SFB_BYTES       0x1044000u
++extern "C" vm_offset_t ml_io_map_wcomb(vm_offset_t phys_addr, vm_size_t size);
++static vm_offset_t sfb_idma, sfb_decon, sfb_back;
++static int sfb_on = -1;                 /* -1 not looked at yet, 0 one buffer, 1 two */
++static unsigned sfb_shown;
++static uint64_t sfb_flips;
++
++static void
++sfb_set(unsigned slot)
++{
++	*(volatile uint32_t *)(sfb_idma + 0x40) = slot ? SFB_PA1 : SFB_PA0;
++	__asm__ volatile ("dsb sy" ::: "memory");
++	volatile uint32_t *req = (volatile uint32_t *)(sfb_decon + 0x60);
++	*req = *req | 0x8000003fu;
++	sfb_shown = slot;
++}
++
++static bool
++sfb_settled(void)
++{
++	volatile uint32_t *req = (volatile uint32_t *)(sfb_decon + 0x60);
++	for (unsigned us = 0; us < 40000; us += 50) {
++		if (*req == 0) {
++			return true;
++		}
++		delay(50);
++	}
++	IOLog("HEROLTE FB: flip never taken (DECON +60 %08x, after %llu flips); one buffer from now on\n", *req, sfb_flips);
++	sfb_on = 0;
++	sfb_set(0);
++	return false;
++}
++
++static bool
++sfb_ready(void)
++{
++	if (sfb_on < 0) {
++		uint32_t on = 0;
++		PE_parse_boot_argn("sweetfb_flip", &on, sizeof(on));
++		sfb_on = 0;
++		if (on) {
++			sfb_idma = ml_io_map(0x128b1000u, 0x1000);
++			sfb_decon = ml_io_map(0x12860000u, 0x1000);
++			sfb_back = ml_io_map_wcomb(SFB_PA1, SFB_BYTES);
++			uint32_t base = sfb_idma ? *(volatile uint32_t *)(sfb_idma + 0x40) : 0;
++			sfb_on = (sfb_decon && sfb_back && base == SFB_PA0) ? 1 : 0;
++			IOLog("HEROLTE FB: two buffers %s (IDMA base %08x)\n", sfb_on ? "on" : "off", base);
++		}
++	}
++	return sfb_on == 1;
++}
++
++/* Before the fade of a display going off, which writes the first buffer. */
++static void
++sfb_primary(void)
++{
++	if (sfb_on == 1 && sfb_settled() && sfb_shown != 0) {
++		sfb_set(0);
++		(void)sfb_settled();
++	}
++}
++static int sfb_drawn = -1;              /* the buffer this present() drew into */
++#endif
++
 +/* Copy each enabled layer's surface into the panel memory (no scaling). */
 +/*
 + * A swap only records the frame: copying 10 MB into the panel on every
@@ -118609,20 +118860,33 @@ index 000000000..cc9b6f68b
 +	 * frame as last drawn (gShadow: what is on the panel, by logical position, whichever layer put it there) and
 +	 * redo only the source rows that changed. A rectangle the shadow cannot hold invalidates it (next frame all rows).
 +	 */
-+	static uint32_t gShadow[2048 * 1024];
-+	static bool gShadowValid;
++	static uint32_t gShadows[2][2048 * 1024];
++	static bool gShadowValids[2];
++	unsigned slot = 0;
++	uintptr_t target = fPixels;
 +#if defined(ARM64_BOARD_CONFIG_HEROLTE)
-+	if (__atomic_exchange_n(&sweet_fb_shadow_stale, false, __ATOMIC_ACQ_REL)) {
-+		gShadowValid = false;                   /* the present helper drew the panel since: the shadow is not what it shows */
++	if (sfb_ready() && sfb_settled()) {
++		if (sfb_drawn < 0) {
++			sfb_drawn = (int)(1 - sfb_shown);
++		}
++		slot = (unsigned)sfb_drawn;             /* each buffer has its own shadow: what it holds */
++		target = slot ? sfb_back : fPixels;
 +	}
 +#endif
-+	bool useShadow = (uint64_t)fLogicalW * fLogicalH <= sizeof(gShadow) / sizeof(gShadow[0]) &&
++	uint32_t *gShadow = gShadows[slot];
++	bool &gShadowValid = gShadowValids[slot];
++#if defined(ARM64_BOARD_CONFIG_HEROLTE)
++	if (__atomic_exchange_n(&sweet_fb_shadow_stale, false, __ATOMIC_ACQ_REL)) {
++		gShadowValids[0] = gShadowValids[1] = false;    /* the present helper drew the panel since: the shadow is not what it shows */
++	}
++#endif
++	bool useShadow = (uint64_t)fLogicalW * fLogicalH <= sizeof(gShadows[0]) / sizeof(gShadows[0][0]) &&
 +	    dx >= 0 && dy >= 0 && dx + w <= (int32_t)fLogicalW && dy + h <= (int32_t)fLogicalH;
 +	if (!useShadow) {
 +		gShadowValid = false;
 +	}
 +	struct sweet_fb_scale_job job = {
-+		this, src, srcRowBytes, dx, dy, w, h, px0, pw, py0, py1, column, gShadow, gShadowValid, useShadow, 0
++		this, src, srcRowBytes, target, dx, dy, w, h, px0, pw, py0, py1, column, gShadow, gShadowValid, useShadow, 0
 +	};
 +#if defined(ARM64_BOARD_CONFIG_HEROLTE)
 +	/* Note 8: the bands run on the copy helpers too, split on source rows so no two share a shadow row. */
@@ -118649,7 +118913,7 @@ index 000000000..cc9b6f68b
 +	bool gShadowValid = j->shadowValid, useShadow = j->useShadow;
 +	uint32_t fLogicalW = self->fLogicalW, fLogicalH = self->fLogicalH, fWidth = self->fWidth, fHeight = self->fHeight;
 +	uint32_t fRowBytes = self->fRowBytes;
-+	uintptr_t fPixels = (uintptr_t)self->fPixels;
++	uintptr_t fPixels = j->pixels;
 +	int32_t rFirst = (int32_t)((int64_t)h * band / bands), rLast = (int32_t)((int64_t)h * (band + 1) / bands);
 +	/*
 +	 * Within a changed row only the span between the first and the last differing pixel is redone (xs..xe, panel
@@ -118887,6 +119151,17 @@ index 000000000..cc9b6f68b
 +		}
 +		s->release();
 +	}
++#if defined(ARM64_BOARD_CONFIG_HEROLTE)
++	if (sfb_drawn >= 0) {
++		if (sfb_on == 1) {
++			sfb_set((unsigned)sfb_drawn);
++			if (++sfb_flips <= 3 || sfb_flips % 3000 == 0) {
++				IOLog("HEROLTE FB: flip %llu to buffer %d\n", sfb_flips, sfb_drawn);
++			}
++		}
++		sfb_drawn = -1;
++	}
++#endif
 +	return copied;
 +}
 +
@@ -165235,7 +165510,7 @@ index 0a00656a0..437adb105 100644
  	read_lbr();
  #endif
 diff --git a/osfmk/kern/exception.c b/osfmk/kern/exception.c
-index 809dafaaa..d6106a4b6 100644
+index 809dafaaa..f77cd0bc5 100644
 --- a/osfmk/kern/exception.c
 +++ b/osfmk/kern/exception.c
 @@ -820,6 +820,237 @@ exception_triage(
@@ -165476,7 +165751,7 @@ index 809dafaaa..d6106a4b6 100644
  kern_return_t
  bsd_exception(
  	exception_type_t        exception,
-@@ -910,3 +1141,119 @@ sys_perf_notify(thread_t thread, int pid)
+@@ -910,3 +1141,173 @@ sys_perf_notify(thread_t thread, int pid)
  
  	return ret;
  }
@@ -165516,6 +165791,42 @@ index 809dafaaa..d6106a4b6 100644
 +	__atomic_fetch_add(&hpp_lost, 1, __ATOMIC_RELAXED);
 +}
 +
++#define HPS_FRAMES 7
++#define HPS_SLOTS 64
++#define HPS_FN_LO 0x188449bbcull        /* CA::OGL::SW::tex_color_matrix_4x4_bias, unslid */
++#define HPS_FN_HI 0x188449dbcull
++static struct { uint64_t f[HPS_FRAMES]; uint32_t n; } hps[HPS_SLOTS];
++extern pmap_paddr_t pmap_find_pa_nofault(pmap_t pmap, addr64_t va);
++extern unsigned long long ml_phys_read_double_64(addr64_t paddr);
++
++/* A sample inside the color matrix: who called it, by frame pointers, read through the page tables (no faults here). */
++static void
++hps_record(arm_saved_state_t *ss, task_t task, uint64_t slide)
++{
++	uint64_t f[HPS_FRAMES] = { get_saved_state_lr(ss) - slide };
++	uint64_t fp = get_saved_state_fp(ss);
++	pmap_t pmap = task->map->pmap;
++	for (unsigned i = 1; i < HPS_FRAMES && fp && !(fp & 7); i++) {
++		addr64_t a = pmap_find_pa_nofault(pmap, fp), b = pmap_find_pa_nofault(pmap, fp + 8);
++		if (!a || !b) {
++			break;
++		}
++		uint64_t next = ml_phys_read_double_64(a), ret = ml_phys_read_double_64(b);
++		f[i] = ret - slide;
++		if (next <= fp) {
++			break;
++		}
++		fp = next;
++	}
++	for (unsigned s = 0; s < HPS_SLOTS; s++) {
++		if (hps[s].n == 0 || memcmp(hps[s].f, f, sizeof(f)) == 0) {
++			memcpy(hps[s].f, f, sizeof(f));
++			__atomic_fetch_add(&hps[s].n, 1, __ATOMIC_RELAXED);
++			return;
++		}
++	}
++}
++
 +static void
 +hpp_xcall(void *arg __unused)
 +{
@@ -165542,6 +165853,9 @@ index 809dafaaa..d6106a4b6 100644
 +	}
 +	__atomic_fetch_add(&hpp_user, 1, __ATOMIC_RELAXED);
 +	hpp_record(pc);
++	if (pc >= HPS_FN_LO && pc < HPS_FN_HI) {
++		hps_record(ss, task, slide);
++	}
 +}
 +
 +static int hpp_on = -1;
@@ -165593,6 +165907,21 @@ index 809dafaaa..d6106a4b6 100644
 +		hpp_count[i] = 0;
 +		hpp_pc[i] = 0;
 +	}
++	for (unsigned k = 0; k < 8; k++) {
++		unsigned best = HPS_SLOTS;
++		for (unsigned i = 0; i < HPS_SLOTS; i++) {
++			if (hps[i].n && (best == HPS_SLOTS || hps[i].n > hps[best].n)) {
++				best = i;
++			}
++		}
++		if (best == HPS_SLOTS) {
++			break;
++		}
++		printf("PCSTACK: %u 0x%llx 0x%llx 0x%llx 0x%llx 0x%llx 0x%llx 0x%llx\n", hps[best].n, hps[best].f[0], hps[best].f[1],
++		    hps[best].f[2], hps[best].f[3], hps[best].f[4], hps[best].f[5], hps[best].f[6]);
++		hps[best].n = 0;
++	}
++	bzero(hps, sizeof(hps));
 +	hpp_user = hpp_kernel = hpp_other = hpp_lost = 0;
 +}
 +#endif
@@ -165655,7 +165984,7 @@ index 3657d83c5..1c9224fcf 100644
  	sched_clutch_us_to_abstime(sched_clutch_root_bucket_warp_us, sched_clutch_root_bucket_warp);
  	sched_clutch_us_to_abstime(sched_clutch_thread_quantum_us, sched_clutch_thread_quantum);
 diff --git a/osfmk/kern/sched_prim.c b/osfmk/kern/sched_prim.c
-index 8e2958646..645a239a2 100644
+index 8e2958646..34b9bdcff 100644
 --- a/osfmk/kern/sched_prim.c
 +++ b/osfmk/kern/sched_prim.c
 @@ -137,6 +137,61 @@
@@ -165731,7 +166060,60 @@ index 8e2958646..645a239a2 100644
  
  #if DEVELOPMENT || DEBUG
  	if (PE_parse_boot_argn("enable_skstsct", &enable_task_set_cluster_type, sizeof(enable_task_set_cluster_type))) {
-@@ -2939,6 +2998,18 @@ thread_invoke(
+@@ -2105,6 +2164,36 @@ sched_SMT_balance(processor_t cprocessor, processor_set_t cpset)
+ #endif
+ 
+ 	assert(cprocessor == current_processor());
++#if defined(ARM64_BOARD_CONFIG_HEROLTE)
++	/*
++	 * A fast core goes idle (after Scion's sched_slow_secondaries, Galaxy S9, ported to sweet_fast_map): of the slow
++	 * cores that run something at a UI priority, the one with the highest is told to reschedule. thread_select there
++	 * sends the thread back with AST_REBALANCE (below) and choose_processor puts it on this core. Before, a UI thread
++	 * that had landed on an A53 stayed there for its whole quantum, a Mongoose idling beside it.
++	 */
++	if (sweet_fast_map != 0 && bit_test(sweet_fast_map, cprocessor->cpu_id)) {
++		processor_t slow = PROCESSOR_NULL;
++		integer_t highest = BASEPRI_USER_INITIATED - 1;
++		sched_ipi_type_t slow_ipi = SCHED_IPI_NONE;
++		uint64_t running_slow = cpset->cpu_state_map[PROCESSOR_RUNNING] & ~sweet_fast_map &
++		    ~cpset->pending_AST_URGENT_cpu_mask & cpset->recommended_bitmask;
++		for (int cpuid = lsb_first(running_slow); cpuid >= 0; cpuid = lsb_next(running_slow, cpuid)) {
++			processor_t sp = processor_array[cpuid];
++			if (sp != cprocessor && sp->current_pri < BASEPRI_RTQUEUES && sp->current_pri > highest) {
++				highest = sp->current_pri;
++				slow = sp;
++			}
++		}
++		if (slow != PROCESSOR_NULL) {
++			slow_ipi = sched_ipi_action(slow, NULL, SCHED_IPI_EVENT_SMT_REBAL);
++		}
++		pset_unlock(cpset);
++		if (slow != PROCESSOR_NULL && slow_ipi != SCHED_IPI_NONE) {
++			sched_ipi_perform(slow, slow_ipi);
++		}
++		return;
++	}
++#endif
+ 	if (cprocessor->is_SMT == FALSE) {
+ 		goto smt_balance_exit;
+ 	}
+@@ -2581,6 +2670,15 @@ restart:
+ 		bool is_yielding         = (*reason & AST_YIELD) == AST_YIELD;
+ 
+ 		bool needs_smt_rebalance = !is_yielding && thread->sched_pri < BASEPRI_RTQUEUES && processor->processor_primary != processor;
++#if defined(ARM64_BOARD_CONFIG_HEROLTE)
++		/* A thread that wants a fast core, on a slow one, while a fast one is idle: it moves (sched_SMT_balance above). */
++		if (!needs_smt_rebalance && !is_yielding && sweet_fast_map != 0 && thread->sched_pri < BASEPRI_RTQUEUES &&
++		    thread->bound_processor == PROCESSOR_NULL && !bit_test(sweet_fast_map, processor->cpu_id) &&
++		    (pset->recommended_bitmask & pset->primary_map & sweet_fast_map & pset->cpu_state_map[PROCESSOR_IDLE]) != 0 &&
++		    sweet_wants_fast(thread)) {
++			needs_smt_rebalance = true;
++		}
++#endif
+ 
+ 		bool affinity_mismatch   = thread->affinity_set != AFFINITY_SET_NULL && thread->affinity_set->aset_pset != pset;
+ 
+@@ -2939,6 +3037,18 @@ thread_invoke(
  	thread_t                        thread,
  	ast_t                           reason)
  {
@@ -165750,7 +166132,7 @@ index 8e2958646..645a239a2 100644
  	if (__improbable(get_preemption_level() != 0)) {
  		int pl = get_preemption_level();
  		panic("thread_invoke: preemption_level %d, possible cause: %s",
-@@ -5083,6 +5154,19 @@ choose_processor(
+@@ -5083,6 +5193,19 @@ choose_processor(
  				 * idle processor. The platform layer had an opportunity to provide
  				 * the "least cost idle" processor above.
  				 */
@@ -165770,7 +166152,7 @@ index 8e2958646..645a239a2 100644
  				if ((thread->sched_pri < BASEPRI_RTQUEUES) || processor_is_fast_track_candidate_for_realtime_thread(pset, processor)) {
  					return processor;
  				}
-@@ -5246,7 +5330,33 @@ no_available_cpus:
+@@ -5246,7 +5369,33 @@ no_available_cpus:
  		/* there shouldn't be a pending AST if the processor is idle */
  		assert((idle_primary_map & pset->pending_AST_URGENT_cpu_mask) == 0);
  
@@ -165804,7 +166186,7 @@ index 8e2958646..645a239a2 100644
  		if (cpuid >= 0) {
  			processor = processor_array[cpuid];
  			return processor;
-@@ -8307,6 +8417,12 @@ try_again:
+@@ -8307,6 +8456,12 @@ try_again:
  	if (avoid_cpu0) {
  		primary_map = bit_ror64(primary_map, 1);
  	}

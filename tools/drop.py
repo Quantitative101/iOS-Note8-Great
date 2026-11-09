@@ -21,12 +21,85 @@ import struct
 import subprocess
 import sys
 import time
+import zipfile
 
 DEV = '/dev/block/platform/11120000.ufs/by-name/USERDATA'
 BLOCK = 4096
 LOG_BLOCKS = 1 + (4 << 20) // BLOCK
 DROP_BLOCKS = 32768
 PREFIX = '/private/var/herolte/'
+
+
+LC_ENCRYPTION_INFO, LC_ENCRYPTION_INFO_64, CPU_TYPE_ARM64 = 0x21, 0x2c, 0x0100000c
+
+
+def macho_slices(data):
+    """[(cputype, cpusubtype, offset)] of a Mach-O or fat file; [] for anything else."""
+    if len(data) < 32:
+        return []
+    magic = struct.unpack_from('>I', data, 0)[0]
+    if magic in (0xcafebabe, 0xcafebabf):
+        wide = magic == 0xcafebabf
+        out = []
+        for i in range(min(struct.unpack_from('>I', data, 4)[0], 16)):
+            if wide:
+                ct, st, off = struct.unpack_from('>IIQ', data, 8 + i * 32)
+            else:
+                ct, st, off = struct.unpack_from('>III', data, 8 + i * 20)
+            out.append((ct, st & 0xffffff, off))
+        return out
+    if struct.unpack_from('<I', data, 0)[0] in (0xfeedfacf, 0xfeedface):
+        ct, st = struct.unpack_from('<II', data, 4)
+        return [(ct, st & 0xffffff, 0)]
+    return []
+
+
+def macho_encrypted(data, off):
+    magic, _, _, _, ncmds = struct.unpack_from('<IIIII', data, off)
+    p = off + (32 if magic == 0xfeedfacf else 28)
+    for _ in range(ncmds):
+        cmd, size = struct.unpack_from('<II', data, p)
+        if cmd in (LC_ENCRYPTION_INFO, LC_ENCRYPTION_INFO_64) and struct.unpack_from('<I', data, p + 16)[0] != 0:
+            return True
+        p += size
+    return False
+
+
+def app_items(src):
+    """[(dest, bytes, mode)] of an app from an .ipa or a .app folder (after the S7 port's herolte-drop.py); exits on what cannot run."""
+    files = []
+    if os.path.isdir(src):
+        name = os.path.basename(os.path.normpath(src))
+        for root, _, names in os.walk(src):
+            for n in names:
+                full = os.path.join(root, n)
+                if not os.path.islink(full):
+                    files.append((os.path.relpath(full, src), open(full, 'rb').read()))
+    else:
+        z = zipfile.ZipFile(src)
+        apps = sorted({i.split('/')[1] for i in z.namelist() if i.startswith('Payload/') and i.split('/')[1].endswith('.app')})
+        if len(apps) != 1:
+            sys.exit(f'{src}: expected one Payload/NAME.app, found {apps}')
+        name = apps[0]
+        for info in z.infolist():
+            if not info.is_dir() and info.filename.startswith(f'Payload/{name}/') and (info.external_attr >> 16) & 0o170000 != 0o120000:
+                files.append((info.filename[len(f'Payload/{name}/'):], z.read(info)))
+    if not name.endswith('.app'):
+        sys.exit(f'{src}: not an app bundle')
+    machos = 0
+    for rel, data in files:
+        slices = macho_slices(data)
+        if slices:
+            machos += 1
+            arm64 = [s for s in slices if s[0] == CPU_TYPE_ARM64 and s[1] != 2]         # 2: arm64e
+            if not arm64:
+                sys.exit(f'{name}/{rel}: no plain arm64 code; it cannot run here')
+            if any(macho_encrypted(data, s[2]) for s in arm64):
+                sys.exit(f'{name}/{rel}: encrypted (FairPlay, an App Store download): it cannot run here')
+    if machos == 0:
+        sys.exit(f'{src}: no executable found')
+    print(f'app {name}: {len(files)} files, {machos} Mach-O, {sum(len(d) for _, d in files) >> 10} KiB')
+    return [(f'apps/{name}/{rel}', data, 0o755 if macho_slices(data) else 0o644) for rel, data in files]
 
 
 def adb(tool, *args, data=None):
@@ -37,7 +110,19 @@ def pack(items):
     payload = bytearray()
     dirs = set()
     entries = []
+    files = []
+    have_apps = False
     for dest, src in items:
+        if dest == 'app':
+            files += app_items(src)
+            have_apps = True
+            continue
+        data = open(src, 'rb').read()
+        mode = 0o755 if os.access(src, os.X_OK) or dest.strip('/') == 'autorun' else 0o644
+        files.append((dest, data, mode))
+    if have_apps:
+        files.append(('apps/.ready', b'ready\n', 0o644))        # last: autorun waits for it
+    for dest, data, mode in files:
         dest = dest.strip('/')
         parts = dest.split('/')
         for i in range(1, len(parts)):
@@ -45,8 +130,8 @@ def pack(items):
             if d not in dirs:
                 dirs.add(d)
                 entries.append((d, 0, b''))
-        data = open(src, 'rb').read()
-        mode = 0o755 if os.access(src, os.X_OK) or dest == 'autorun' else 0o644
+        if len(PREFIX + dest) > 255:
+            sys.exit(f'path too long for the drop zone: {dest}')
         entries.append((PREFIX + dest, mode, data))
     for path, mode, data in entries:
         p = path.encode()

@@ -13,6 +13,10 @@ no IPSW contents, device trees, boot images, kernels, firmware or bootloader pie
 - Boot through S-Boot with a small loader (`loader/`) appended to the stock boot image, all 8 CPUs
 - UFS storage, root on `userdata` (HFS+), launchd, backboardd, SpringBoard home screen
 - Panel through IOMobileFramebuffer on a 750x1542 logical canvas, scaled to 1440x2960 by the CPU (parallel bands)
+- Tear-free display with `sweetfb_flip=1`: frames are drawn into a second panel buffer, then IDMA0's base address changes
+  (0x128b1000 +0x40) and DECON_F +0x60 requests the update
+- Scheduler, timer and frame-rate tuning ported from the Galaxy S7 port (UI threads to fast cores, no timer coalescing,
+  CoreAnimation told 120 Hz, widget CPU cap, SpringBoard frame-rate caps raised)
 - Touch (sec_ts over bit-banged I2C, with bus recovery), power and volume keys, battery level
 - Wi-Fi (BCM4361 over PCIe): open and WPA2 networks; WPA3 is not supported by the firmware
 - Mali-G71 runs jobs; Mesa Panfrost draws through a small shim (slower than the CPU path for the UI for now)
@@ -20,6 +24,10 @@ no IPSW contents, device trees, boot images, kernels, firmware or bootloader pie
 - CPU clocks above the bootloader's: Mongoose 1703 MHz and A53 1690 MHz through Samsung's ACPM firmware, with a thermal
   guard that steps the clocks down when the SoC gets hot (see below)
 - Idle CPU use cut by stopping a HAL plug-in lookup loop in mediaserverd (`autorun/`)
+
+iPhone 8 style navigation is the stable setup: an empty `gestures.off` in the drop zone skips the X-style gesture hooks,
+whose top-edge Control Center pull crashes SpringBoard; the Bixby key is Home. App install from the drop zone
+(`tools/drop.py app=FILE.ipa|DIR.app`) copies the app to `/Applications`, but registering it with LaunchServices still fails.
 
 Not working: cellular, Bluetooth, audio, camera, sensors, USB device mode, joining networks from iOS Settings
 (the kernel joins the network given in a drop-zone file instead).

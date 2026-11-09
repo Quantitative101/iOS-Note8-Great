@@ -183,10 +183,136 @@ ask_for_gestures(void)
       method_setImplementation(enabled, (IMP)says_yes);
 }
 
+/*
+ * SpringBoard's own frame rate caps (from the S7 port's herosb.c, after Scion's inject_sb.c). Some of its animations ask
+ * for fewer frames than the panel has, such as CAFrameRateRangeMake(20, 30, 0) for the page dots after every slide. A
+ * range whose most is under 60 gets 60 as its most and preferred. DROP_DIR fps.off leaves them as Apple set them.
+ */
+typedef struct { float minimum, maximum, preferred; } frame_rate_range_t;
+static void (*fluid_set_range_was)(id, SEL, frame_rate_range_t, unsigned);
+static void (*animation_set_range_was)(id, SEL, frame_rate_range_t, unsigned);
+static unsigned ranges_raised;
+
+static frame_rate_range_t
+raise_range(frame_rate_range_t range)
+{
+   if (range.maximum > 0.0f && range.maximum < 60.0f) {
+      range.maximum = 60.0f;
+      range.preferred = 60.0f;
+      ranges_raised++;
+   }
+   return range;
+}
+
+static void
+fluid_set_range(id self, SEL cmd, frame_rate_range_t range, unsigned reason)
+{
+   fluid_set_range_was(self, cmd, raise_range(range), reason);
+}
+
+static void
+animation_set_range(id self, SEL cmd, frame_rate_range_t range, unsigned reason)
+{
+   animation_set_range_was(self, cmd, raise_range(range), reason);
+}
+
+static void
+raise_frame_rates(void)
+{
+   SEL set = sel_registerName("setFrameRateRange:highFrameRateReason:");
+   Class fluid = objc_getClass("SBFFluidBehaviorSettings"), animation = objc_getClass("SBFAnimationSettings");
+   Method m = fluid && !fluid_set_range_was ? class_getInstanceMethod(fluid, set) : NULL;
+   if (m)
+      fluid_set_range_was = (void (*)(id, SEL, frame_rate_range_t, unsigned))method_setImplementation(m, (IMP)fluid_set_range);
+   m = animation && !animation_set_range_was ? class_getInstanceMethod(animation, set) : NULL;
+   if (m)
+      animation_set_range_was = (void (*)(id, SEL, frame_rate_range_t, unsigned))method_setImplementation(m, (IMP)animation_set_range);
+   herodrm_log("herosb: frame rate caps raised to 60: fluid settings %s, animation settings %s",
+      fluid_set_range_was ? "yes" : "NO", animation_set_range_was ? "yes" : "NO");
+}
+
+static void
+report_ranges(void *unused)
+{
+   herodrm_log("herosb: %u frame rate ranges raised to 60 so far", ranges_raised);
+}
+
+/*
+ * DROP_DIR novibrant: SpringBoard's layers lose CoreAnimation's vibrancy filters (vibrantDark, vibrantLight,
+ * vibrantColorMatrix and their SourceOver forms). Drawn by the CPU they were a third of backboardd's time
+ * (greatlte_pcprof, CA::OGL::SW::tex_vibrant_color_matrix); without them the layer draws plainly.
+ */
+static void (*set_compositing_was)(id, SEL, id);
+static void (*set_filters_was)(id, SEL, id);
+static unsigned vibrant_removed;
+
+static bool
+is_vibrant(id filter)
+{
+   if (!filter)
+      return false;
+   id name = filter;
+   if (!((BOOL (*)(id, SEL, SEL))objc_msgSend)(filter, sel_registerName("respondsToSelector:"), sel_registerName("UTF8String")))
+      name = ((id (*)(id, SEL))objc_msgSend)(filter, sel_registerName("type"));
+   const char *text = name ? ((const char *(*)(id, SEL))objc_msgSend)(name, sel_registerName("UTF8String")) : NULL;
+   return text && strncmp(text, "vibrant", 7) == 0;
+}
+
+static void
+set_compositing(id self, SEL cmd, id filter)
+{
+   if (is_vibrant(filter)) {
+      vibrant_removed++;
+      filter = nil;
+   }
+   set_compositing_was(self, cmd, filter);
+}
+
+static void
+set_filters(id self, SEL cmd, id filters)
+{
+   unsigned long n = filters ? ((unsigned long (*)(id, SEL))objc_msgSend)(filters, sel_registerName("count")) : 0;
+   id kept = n ? ((id (*)(id, SEL))objc_msgSend)((id)objc_getClass("NSMutableArray"), sel_registerName("array")) : nil;
+   for (unsigned long i = 0; i < n; i++) {
+      id f = ((id (*)(id, SEL, unsigned long))objc_msgSend)(filters, sel_registerName("objectAtIndex:"), i);
+      if (is_vibrant(f))
+         vibrant_removed++;
+      else
+         ((void (*)(id, SEL, id))objc_msgSend)(kept, sel_registerName("addObject:"), f);
+   }
+   set_filters_was(self, cmd, n ? kept : filters);
+}
+
+static void
+report_vibrant(void *unused)
+{
+   herodrm_log("herosb: %u vibrancy filters removed so far", vibrant_removed);
+}
+
+static void
+remove_vibrancy(void)
+{
+   Class layer = objc_getClass("CALayer");
+   Method m = layer ? class_getInstanceMethod(layer, sel_registerName("setCompositingFilter:")) : NULL;
+   if (m)
+      set_compositing_was = (void (*)(id, SEL, id))method_setImplementation(m, (IMP)set_compositing);
+   m = layer ? class_getInstanceMethod(layer, sel_registerName("setFilters:")) : NULL;
+   if (m)
+      set_filters_was = (void (*)(id, SEL, id))method_setImplementation(m, (IMP)set_filters);
+   herodrm_log("herosb: vibrancy hooks: compositing %s, filters %s", set_compositing_was ? "yes" : "NO", set_filters_was ? "yes" : "NO");
+   dispatch_after_f(dispatch_time(DISPATCH_TIME_NOW, 120 * NSEC_PER_SEC), dispatch_get_main_queue(), NULL, report_vibrant);
+}
+
 __attribute__((constructor)) static void
 herosb_start(void)
 {
    herodrm_log("herosb: constructor in %s", getprogname());
+   if (access(DROP_DIR "novibrant", F_OK) == 0)
+      remove_vibrancy();
+   if (access(DROP_DIR "fps.off", F_OK) != 0) {
+      raise_frame_rates();
+      dispatch_after_f(dispatch_time(DISPATCH_TIME_NOW, 120 * NSEC_PER_SEC), dispatch_get_main_queue(), NULL, report_ranges);
+   }
    if (access(DROP_DIR "gestures.off", F_OK) != 0)
       ask_for_gestures();
    herodrm_log("herosb: gestures %d, status bar hooks %d", gestures_on, status_bar_kept);

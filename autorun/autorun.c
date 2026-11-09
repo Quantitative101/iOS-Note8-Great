@@ -11,10 +11,18 @@
  */
 #include <CoreFoundation/CoreFoundation.h>
 #include <dirent.h>
+#include <dlfcn.h>
+#include <errno.h>
 #include <fcntl.h>
+#include <objc/message.h>
+#include <objc/runtime.h>
+void *objc_autoreleasePoolPush(void);
+void objc_autoreleasePoolPop(void *);
 #include <spawn.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
+#include <time.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -287,9 +295,218 @@ set_appearance(void)
    }
 }
 
-int
-main(void)
+/* Log channel: "spawn" a path that does not exist; the kernel prints "SPAWN FAILED <proc>: <path> -> 2". */
+extern char **environ;
+
+static void
+alog(const char *format, ...)
 {
+   char line[400], path[420];
+   va_list ap;
+   va_start(ap, format);
+   vsnprintf(line, sizeof line, format, ap);
+   va_end(ap);
+   snprintf(path, sizeof path, "/autorun/%s", line);
+   pid_t pid;
+   char *argv[2] = { path, NULL };
+   posix_spawn(&pid, path, NULL, NULL, argv, environ);
+}
+
+/*
+ * Apps from the drop zone (tools/drop.py app=FILE.ipa or app=DIR.app), after the S7 port's hero-run: DROP_DIR apps/NAME.app and
+ * then apps/.ready. Each moves to /Applications, where a bundle of that name we did not put there is left alone, and
+ * LaunchServices is told by fresh processes of this program, each with an alarm: never a wait on lsd for as long as the
+ * phone runs. Not before the LaunchServices migrator has run and the system has settled (on the S7, at 20 s LSRegisterURL
+ * failed; the rebuild it then asked for never ended, nor did SpringBoard's wait). DROP_DIR apps.remove, one NAME.app a
+ * line, takes one of ours out. The apps need the no-container and no-sandbox entitlements (note8/apps/entitlements.plist).
+ */
+#define APPS_DIR DROP_DIR "apps/"
+#define APP_MARK ".herolte-app"
+#define MAX_APPS 32
+#define LS_MIGRATOR "/System/Library/DataClassMigrators/00LaunchServicesMigrator.migrator"
+#define LS_MIGRATED DROP_DIR "lsmigrator.done"
+
+static id
+nsstring(const char *text)
+{
+   return ((id (*)(id, SEL, const char *))objc_msgSend)((id)objc_getClass("NSString"), sel_registerName("stringWithUTF8String:"), text);
+}
+
+static id
+file_url(const char *path)
+{
+   return ((id (*)(id, SEL, id))objc_msgSend)((id)objc_getClass("NSURL"), sel_registerName("fileURLWithPath:"), nsstring(path));
+}
+
+static int
+remove_tree(const char *path)
+{
+   struct stat st;
+   if (lstat(path, &st) != 0)
+      return errno == ENOENT ? 0 : -1;
+   if (!S_ISDIR(st.st_mode))
+      return unlink(path);
+   DIR *d = opendir(path);
+   struct dirent *e;
+   while (d && (e = readdir(d))) {
+      char child[1024];
+      if (strcmp(e->d_name, ".") == 0 || strcmp(e->d_name, "..") == 0)
+         continue;
+      snprintf(child, sizeof(child), "%s/%s", path, e->d_name);
+      remove_tree(child);
+   }
+   if (d)
+      closedir(d);
+   return rmdir(path);
+}
+
+static void
+remove_listed_apps(void)
+{
+   FILE *f = fopen(DROP_DIR "apps.remove", "r");
+   char name[256];
+   while (f && fgets(name, sizeof(name), f)) {
+      char path[320], mark[360];
+      name[strcspn(name, "\r\n")] = 0;
+      size_t len = strlen(name);
+      if (len < 5 || strchr(name, '/') || strcmp(name + len - 4, ".app") != 0)
+         continue;
+      snprintf(path, sizeof(path), "/Applications/%s", name);
+      snprintf(mark, sizeof(mark), "%s/" APP_MARK, path);
+      if (access(mark, F_OK) != 0) {
+         alog("app %s: not one of ours, left alone", name);
+         continue;
+      }
+      alog("app %s: taken out of /Applications (%d)", name, remove_tree(path));
+   }
+   if (f) {
+      fclose(f);
+      unlink(DROP_DIR "apps.remove");
+   }
+}
+
+/* A fresh process: objc in a forked child of a threaded one aborts. */
+static int
+ls_migrate(void)
+{
+   alarm(120);
+   void *pool = objc_autoreleasePoolPush();
+   dlopen("/System/Library/Frameworks/Foundation.framework/Foundation", RTLD_NOW);
+   id bundle = ((id (*)(id, SEL, id))objc_msgSend)((id)objc_getClass("NSBundle"), sel_registerName("bundleWithPath:"), nsstring(LS_MIGRATOR));
+   BOOL loaded = bundle ? ((BOOL (*)(id, SEL))objc_msgSend)(bundle, sel_registerName("load")) : NO;
+   id cls = bundle ? ((id (*)(id, SEL))objc_msgSend)(bundle, sel_registerName("principalClass")) : nil;
+   alog("LS migrator: bundle %d, loaded %d, class %d", bundle != nil, loaded, cls != nil);
+   if (cls) {
+      id migrator = ((id (*)(id, SEL))objc_msgSend)(((id (*)(id, SEL))objc_msgSend)(cls, sel_registerName("alloc")), sel_registerName("init"));
+      time_t start = time(NULL);
+      BOOL done = ((BOOL (*)(id, SEL))objc_msgSend)(migrator, sel_registerName("performMigration"));
+      alog("LS migrator: performMigration %d, %ld s", done, (long)(time(NULL) - start));
+   }
+   objc_autoreleasePoolPop(pool);
+   return 0;
+}
+
+static int
+register_apps(int argc, char **argv)
+{
+   alarm(120);
+   void *pool = objc_autoreleasePoolPush();
+   int failed = 0, status[MAX_APPS];
+   dlopen("/System/Library/Frameworks/Foundation.framework/Foundation", RTLD_NOW);
+   dlopen("/System/Library/Frameworks/CoreServices.framework/CoreServices", RTLD_NOW);
+   int (*lsregister)(id, unsigned char) = (int (*)(id, unsigned char))dlsym(RTLD_DEFAULT, "LSRegisterURL");
+   for (int i = 2; i < argc && i - 2 < MAX_APPS; i++)
+      status[i - 2] = lsregister ? lsregister(file_url(argv[i]), 1) : -1;       /* as root */
+   if (setgid(501) != 0 || setuid(501) != 0)
+      alog("apps: cannot become mobile");
+   Class ws = objc_getClass("LSApplicationWorkspace");
+   id workspace = ws ? ((id (*)(id, SEL))objc_msgSend)((id)ws, sel_registerName("defaultWorkspace")) : nil;
+   SEL reg = sel_registerName("registerApplication:");
+   for (int i = 2; i < argc && i - 2 < MAX_APPS; i++) {
+      BOOL ok = NO;
+      if (workspace && ((BOOL (*)(id, SEL, SEL))objc_msgSend)(workspace, sel_registerName("respondsToSelector:"), reg))
+         ok = ((BOOL (*)(id, SEL, id))objc_msgSend)(workspace, reg, file_url(argv[i]));
+      alog("app %s: LSRegisterURL %d, registerApplication %d", argv[i], status[i - 2], ok);
+      failed += status[i - 2] != 0 && !ok;
+   }
+   objc_autoreleasePoolPop(pool);
+   return failed ? 1 : 0;
+}
+
+static int
+run_self(char **args)
+{
+   pid_t pid;
+   int status = 0, err = posix_spawn(&pid, args[0], NULL, NULL, args, environ);
+   if (err == 0)
+      waitpid(pid, &status, 0);
+   alog("%s: spawn %d, status %#x", args[1], err, status);
+   return err || !WIFEXITED(status) ? -1 : WEXITSTATUS(status);
+}
+
+int memorystatus_control(uint32_t command, int32_t pid, uint32_t flags, void *buffer, size_t buffersize);
+
+static void
+install_apps(void)
+{
+   static char paths[MAX_APPS][320];
+   char *args[MAX_APPS + 3] = { DROP_DIR "autorun", "--register-apps" };
+   int n = 0;
+   if (access(APPS_DIR ".ready", F_OK) != 0)
+      return;
+   DIR *d = opendir(APPS_DIR);
+   struct dirent *e;
+   while (d && (e = readdir(d)) && n < MAX_APPS) {
+      size_t len = strlen(e->d_name);
+      char from[320], mark[360];
+      struct stat st;
+      if (len < 5 || strcmp(e->d_name + len - 4, ".app") != 0)
+         continue;
+      snprintf(from, sizeof(from), APPS_DIR "%s", e->d_name);
+      snprintf(paths[n], sizeof(paths[n]), "/Applications/%s", e->d_name);
+      snprintf(mark, sizeof(mark), "%s/" APP_MARK, paths[n]);
+      if (lstat(paths[n], &st) == 0) {
+         if (access(mark, F_OK) != 0) {
+            alog("app %s: /Applications has its own by that name; left alone", e->d_name);
+            continue;
+         }
+         remove_tree(paths[n]);
+      }
+      if (rename(from, paths[n]) != 0) {
+         alog("app %s: cannot move it: errno %d", e->d_name, errno);
+         continue;
+      }
+      close(open(mark, O_WRONLY | O_CREAT, 0644));
+      alog("app %s: put in /Applications", e->d_name);
+      args[2 + n] = paths[n];
+      n++;
+   }
+   if (d)
+      closedir(d);
+   unlink(APPS_DIR ".ready");
+   args[2 + n] = NULL;
+   if (n == 0)
+      return;
+   /* boot-app1: SIGKILLed while it slept, as an idle daemon; memorystatus band 10 (MEMORYSTATUS_CMD_SET_PRIORITY_PROPERTIES). */
+   struct { int32_t priority; uint64_t user_data; } band = { 10, 0 };
+   alog("apps: memorystatus band 10: %d", memorystatus_control(2, getpid(), 0, &band, sizeof(band)));
+   sleep(45);
+   if (access(LS_MIGRATED, F_OK) != 0) {
+      char *migrate[] = { DROP_DIR "autorun", "--ls-migrate", NULL };
+      close(open(LS_MIGRATED, O_WRONLY | O_CREAT, 0644));
+      run_self(migrate);
+   }
+   alog("apps: %d given to LaunchServices: %d", n, run_self(args));
+}
+
+int
+main(int argc, char **argv)
+{
+   if (argc > 1 && strcmp(argv[1], "--register-apps") == 0)
+      return register_apps(argc, argv);
+   if (argc > 1 && strcmp(argv[1], "--ls-migrate") == 0)
+      return ls_migrate();
+   remove_listed_apps();
    set_appearance();
    if (access(DROP_DIR "present.on", F_OK) == 0)
       run_present();
@@ -300,5 +517,6 @@ main(void)
    if (access(DROP_DIR "ax.off", F_OK) != 0)
       set_accessibility();
    remove_mg_cache_once();
+   install_apps();
    return 0;
 }
